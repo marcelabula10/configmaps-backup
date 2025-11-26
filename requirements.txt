@@ -1,0 +1,4 @@
+deepdiff
+pandas
+prettytable
+openpyxl
