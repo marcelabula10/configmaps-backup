@@ -1,133 +1,152 @@
-#!/usr/bin/env python3
-import os
-import json
-import subprocess
-import datetime
-import argparse
-import pandas as pd
-from pathlib import Path
+import argparse, yaml, subprocess, os, json
+from datetime import datetime
 from deepdiff import DeepDiff
-from prettytable import PrettyTable
 
-# ----------------------------
-# Execute safe shell commands
-# ----------------------------
-def run_cmd(cmd: list):
-    """Executes IBM Cloud CLI and returns output as JSON."""
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        output = result.stdout.strip()
-        return json.loads(output) if output else {}
-    except Exception as e:
-        print(f"[ERROR] while running: {' '.join(cmd)}")
-        print(e)
-        return {}
+from excel_report import generate_excel
+from pdf_report import export_pdf
 
-# ----------------------------
-# Create clean folders
-# ----------------------------
-def ensure_backup_dir(country_code):
-    backup_dir = Path.home() / "Desktop" / "backups" / country_code
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    return backup_dir
+# Base folder where backups are stored
+BASE = os.path.expanduser("~/Desktop/backups")
 
-def timestamp():
-    return datetime.datetime.now().strftime("%Y%m%d_%H%M")
 
-def sanitize(name: str):
-    return name.replace("-", "_")
+def run(cmd):
+    """Executes a shell command and returns stdout as text."""
+    return subprocess.check_output(cmd, shell=True, text=True)
 
-# ----------------------------
-# Backup ConfigMaps
-# ----------------------------
-def backup_configmaps(project, country_code, tag):
-    print(f"\n📦 BACKUP STARTED for {project} → [{tag}]")
 
-    backup_dir = ensure_backup_dir(country_code)
-    fname = f"{country_code}_{sanitize(project)}_{tag}_{timestamp()}.json"
-    file_path = backup_dir / fname
+def load_profiles():
+    """Loads profiles.yaml into a python dictionary."""
+    with open("profiles.yaml") as f:
+        return yaml.safe_load(f)
 
-    # Select project
-    subprocess.run(["ibmcloud", "ce", "project", "select", "-n", project], check=True)
 
-    # List configmaps
-    configmaps = run_cmd(["ibmcloud", "ce", "configmap", "list", "-o", "json"])
-    snapshots = {}
+def set_ibmcloud_context(account, region, rg, project):
+    """
+    Automatically selects:
+    - IBM Cloud account
+    - Region
+    - Resource Group
+    - Code Engine project
+    """
+    run(f"ibmcloud target -c {account}")
+    run(f"ibmcloud target -r {region}")
+    run(f"ibmcloud target -g {rg}")
+    run(f"ibmcloud ce project select -n {project}")
 
-    for cm in configmaps:
-        name = cm["name"]
-        print(f"  ⬇️ Downloading {name}")
-        data = run_cmd(["ibmcloud", "ce", "configmap", "get", "--name", name, "-o", "json"])
-        snapshots[name] = data
 
-    with open(file_path, "w") as f:
-        json.dump(snapshots, f, indent=2)
+def backup(profile, apcode, mode):
+    """
+    Creates a backup of all ConfigMaps in the selected project.
+    mode can be 'before' or 'after'.
+    """
 
-    print(f"✅ Backup saved: {file_path}")
-    return file_path, backup_dir
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = f"{BASE}/{profile}/{apcode}/{mode}/{timestamp}"
+    os.makedirs(path, exist_ok=True)
 
-# ----------------------------
-# Compare before vs after
-# ----------------------------
-def compare_backups(country, project, before_file, after_file, backup_dir):
-    print("\n🔍 COMPARING CONFIGMAPS...")
+    cms_raw = run("ibmcloud ce configmap list")
+    cms = [line.split()[0] for line in cms_raw.splitlines()
+           if "active" in line.lower()]
 
-    with open(before_file) as f1, open(after_file) as f2:
-        before = json.load(f1)
-        after = json.load(f2)
+    for cm in cms:
+        data = run(f"ibmcloud ce configmap get --name {cm} --output json")
+        with open(f"{path}/{cm}.json", "w") as f:
+            f.write(data)
 
-    report = {}
-    table = PrettyTable(["ConfigMap", "Status", "Changes"])
 
-    for name in before.keys() | after.keys():
-        old = before.get(name, {}).get("data", {})
-        new = after.get(name, {}).get("data", {})
-        diff = DeepDiff(old, new, ignore_order=True)
+def generate_report(profile, apcode):
+    """
+    Generates an Excel and PDF diff report comparing the most recent
+    BEFORE and AFTER backups.
+    """
 
-        if diff:
-            report[name] = diff.to_dict()
-            table.add_row([name, "⚠️ Modified", len(diff)])
-        else:
-            table.add_row([name, "OK", "-"])
+    base_path = f"{BASE}/{profile}/{apcode}"
 
-    safe_name = sanitize(project)
-    diff_file = backup_dir / f"{country}_{safe_name}_diff_{timestamp()}.json"
-    summary_file = backup_dir / f"{country}_{safe_name}_summary_{timestamp()}.csv"
+    # Find the latest before + after snapshots
+    before = sorted(os.listdir(f"{base_path}/before"))[-1]
+    after = sorted(os.listdir(f"{base_path}/after"))[-1]
 
-    with open(diff_file, "w") as f:
-        json.dump(report, f, indent=2)
+    before_path = f"{base_path}/before/{before}"
+    after_path = f"{base_path}/after/{after}"
 
-    pd.DataFrame(table._rows, columns=table.field_names).to_csv(summary_file, index=False)
+    results = []
 
-    print("\n📊 RESULTS")
-    print(table)
-    print("\n📌 Saved:")
-    print(diff_file)
-    print(summary_file)
+    for filename in os.listdir(before_path):
+        if filename.endswith(".json"):
 
-    if report:
-        print(f"\n⚠️ {len(report)} ConfigMaps changed!")
-    else:
-        print("\n✨ No differences found!")
+            before_file = os.path.join(before_path, filename)
+            after_file = os.path.join(after_path, filename)
 
-# ----------------------------
-# Main CLI Entry
-# ----------------------------
-def main():
-    parser = argparse.ArgumentParser(description="Audit Code Engine ConfigMaps")
-    parser.add_argument("--country", required=True)
-    parser.add_argument("--project", required=True)
-    parser.add_argument("--mode", required=True, choices=["before", "after"])
-    args = parser.parse_args()
+            with open(before_file) as f:
+                before_data = json.load(f)
 
-    backup_file, backup_dir = backup_configmaps(args.project, args.country, args.mode)
+            # ConfigMap removed entirely
+            if not os.path.exists(after_file):
+                results.append([filename, "-", "-", "-", "Removed", before, after])
+                continue
 
-    if args.mode == "after":
-        before_files = sorted(backup_dir.glob(f"{args.country}*before*.json"))
-        if not before_files:
-            print("⚠️ No previous backup found!")
-            return
-        compare_backups(args.country, args.project, before_files[-1], backup_file, backup_dir)
+            with open(after_file) as f:
+                after_data = json.load(f)
+
+            diff = DeepDiff(before_data, after_data, ignore_order=True)
+
+            # If no differences, skip
+            if not diff:
+                continue
+
+            if "values_changed" in diff:
+                for key, change in diff["values_changed"].items():
+                    results.append([
+                        filename,
+                        key,
+                        change["old_value"],
+                        change["new_value"],
+                        "Modified",
+                        before,
+                        after
+                    ])
+
+            if "dictionary_item_added" in diff:
+                for key in diff["dictionary_item_added"]:
+                    results.append([filename, key, "-", "-", "Added", before, after])
+
+            if "dictionary_item_removed" in diff:
+                for key in diff["dictionary_item_removed"]:
+                    results.append([filename, key, "-", "-", "Removed", before, after])
+
+    # Output paths
+    excel_path = f"{base_path}/report.xlsx"
+    pdf_path = f"{base_path}/report.pdf"
+
+    # Generate both reports
+    generate_excel(results, excel_path)
+    export_pdf(results, pdf_path)
+
 
 if __name__ == "__main__":
-    main()
+
+    # CLI argument parsing
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile", required=True)
+    parser.add_argument("--ap", required=True)
+    parser.add_argument("--mode",
+        required=True, choices=["before","after","report"])
+
+    args = parser.parse_args()
+    profiles = load_profiles()
+
+    p = profiles[args.profile]["projects"][args.ap]
+
+    # Auto-select IBM Cloud context
+    set_ibmcloud_context(
+        profiles[args.profile]["account"],
+        profiles[args.profile]["region"],
+        p["resource_group"],
+        p["project"]
+    )
+
+    # Backup or report
+    if args.mode == "report":
+        generate_report(args.profile, args.ap)
+    else:
+        backup(args.profile, args.ap, args.mode)

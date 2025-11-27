@@ -1,0 +1,18 @@
+BR:
+  account: "XXXXXXXXXXXX"
+  region: "br-sao"
+  projects:
+    AP12093:
+      resource_group: "CARBR-AP12093-RG"
+      project: "prd-br-sao-ap12093"
+    API0477:
+      resource_group: "CARBR-AP10477-RG"
+      project: "prd-br-sao-ap10477"
+
+CH:
+  account: "XXXXXXXXXXXX"
+  region: "br-sao"
+  projects:
+    AP10328:
+      resource_group: "CARCH-API0328-RG"
+      project: "prd-ch-ap10328"
